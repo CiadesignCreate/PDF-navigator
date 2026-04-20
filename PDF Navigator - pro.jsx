@@ -1,15 +1,24 @@
 #targetengine "session"
 
 // ─── LICENCE SYSTEM ───────────────────────────────────────────────────────────
-var PDFNAV_VERSION    = '1.0';
-var PDFNAV_TRIAL_DAYS = 14;
-var PDFNAV_LIC_PATH   = Folder.userData.fsName + '/.pdfnavigator.lic';
+var PDFNAV_VERSION      = '1.0';
+var PDFNAV_TRIAL_DAYS   = 14;
+var PDFNAV_LIC_PATH     = Folder.userData.fsName + '/.pdfnavigator.lic';
+var PDFNAV_LIC_PATH2    = Folder.appData.fsName  + '/PDFNavigator/install.dat';
+var PDFNAV_CACHE_PATH   = Folder.temp.fsName     + '/.pdfnav_tc';
+var PDFNAV_SERVER       = 'https://extraordinary-love-production-465f.up.railway.app';
+var PDFNAV_OFFLINE_GRACE = 3; // jours de tolérance hors-ligne
+var PDFNAV_SALT         = '\x70\x6E\x61\x76\x73\x32\x34'; // sel interne
 
+// ── Primitives ───────────────────────────────────────────────────────────────
 function _navHash(s) {
     var h = 5381;
     for (var i = 0; i < s.length; i++) h = (((h << 5) + h) + s.charCodeAt(i)) | 0;
     return h >>> 0;
 }
+function _navNow() { return Math.floor(new Date().getTime() / 1000); }
+
+// ── Clé de licence attendue ──────────────────────────────────────────────────
 function _navExpectedKey(email) {
     var e  = (email || '').toLowerCase().replace(/\s/g, '');
     var s1 = (0x4E56 | (0x4150 << 16)) >>> 0;
@@ -19,49 +28,179 @@ function _navExpectedKey(email) {
     function x8(n) { return ('0000000' + n.toString(16).toUpperCase()).slice(-8); }
     return 'PDFN-' + x8(h1) + '-' + x8(h2);
 }
-function _navReadLic() {
-    var d = { install: 0, email: '', key: '' };
-    var f = new File(PDFNAV_LIC_PATH);
-    if (!f.exists) return d;
+
+// ── Empreinte machine ────────────────────────────────────────────────────────
+function _navMachineId() {
+    var user = $.getenv('USER') || $.getenv('USERNAME') || 'u';
+    var host = $.getenv('COMPUTERNAME') || $.getenv('HOSTNAME') || 'h';
+    return String(_navHash(user + '\x01' + host + '\x01' + PDFNAV_SALT) >>> 0);
+}
+
+// ── Signature anti-falsification ─────────────────────────────────────────────
+function _navSign(a, b) {
+    return String(_navHash(String(a) + '\x02' + String(b) + '\x02' + PDFNAV_SALT) >>> 0);
+}
+function _navVerifyLic(d, mid) {
+    if (!d || !d.install || !d.mid || !d.sig) return false;
+    if (d.mid !== mid)          return false; // autre machine
+    if (d.install > _navNow())  return false; // date dans le futur = falsifié
+    return d.sig === _navSign(d.install, mid);
+}
+
+// ── Lecture / écriture .lic (2 emplacements) ─────────────────────────────────
+function _navReadLicFile(fpath) {
+    var d = { install: 0, email: '', key: '', mid: '', sig: '' };
+    var f = new File(fpath);
+    if (!f.exists) return null;
     try {
         f.open('r');
         while (!f.eof) {
             var ln = f.readln(), kv = ln.split('=');
             if (kv.length < 2) continue;
-            var k = kv[0].replace(/\s/g, ''), v = kv.slice(1).join('=');
+            var k = kv[0].replace(/\s/g,''), v = kv.slice(1).join('=');
             if (k === 'install') d.install = parseInt(v, 10) || 0;
             if (k === 'email')   d.email   = v;
             if (k === 'key')     d.key     = v;
+            if (k === 'mid')     d.mid     = v;
+            if (k === 'sig')     d.sig     = v;
         }
-        f.close();
-    } catch(e) { try { f.close(); } catch(ee) {} }
-    return d;
+        f.close(); return d;
+    } catch(e) { try { f.close(); } catch(ee) {} return null; }
 }
-function _navWriteLic(d) {
+function _navWriteLicFile(fpath, d) {
     try {
-        var f = new File(PDFNAV_LIC_PATH);
+        var folder = new Folder(new File(fpath).parent.fsName);
+        if (!folder.exists) folder.create();
+        var f = new File(fpath);
         f.lineFeed = 'Unix'; f.open('w');
-        f.writeln('v=1');
+        f.writeln('v=2');
         f.writeln('install=' + (d.install || 0));
+        f.writeln('mid='     + (d.mid     || ''));
+        f.writeln('sig='     + (d.sig     || ''));
         f.writeln('email='   + (d.email   || ''));
         f.writeln('key='     + (d.key     || ''));
         f.close(); return true;
     } catch(e) { return false; }
 }
-function _navNow() { return Math.floor(new Date().getTime() / 1000); }
-function _navStatus() {
-    var lic = _navReadLic();
-    if (!lic.install || lic.install <= 0) { lic.install = _navNow(); _navWriteLic(lic); }
-    var licensed = !!(lic.email && lic.key && lic.key === _navExpectedKey(lic.email));
-    if (licensed) return { mode: 'pro', daysLeft: 9999, email: lic.email };
-    var left = Math.max(0, PDFNAV_TRIAL_DAYS - Math.floor((_navNow() - lic.install) / 86400));
-    return { mode: left > 0 ? 'trial' : 'expired', daysLeft: left, email: '' };
+function _navReadLic() {
+    return _navReadLicFile(PDFNAV_LIC_PATH) ||
+           _navReadLicFile(PDFNAV_LIC_PATH2) ||
+           { install: 0, email: '', key: '', mid: '', sig: '' };
 }
+function _navWriteLic(d) {
+    _navWriteLicFile(PDFNAV_LIC_PATH,  d);
+    _navWriteLicFile(PDFNAV_LIC_PATH2, d);
+}
+
+// ── Cache résultat serveur ───────────────────────────────────────────────────
+function _navWriteCache(daysLeft) {
+    try {
+        var ts = _navNow();
+        var f  = new File(PDFNAV_CACHE_PATH);
+        f.open('w');
+        f.write(ts + ':' + daysLeft + ':' + _navSign(ts, daysLeft));
+        f.close();
+    } catch(e) {}
+}
+function _navReadCache() {
+    try {
+        var f = new File(PDFNAV_CACHE_PATH);
+        if (!f.exists) return null;
+        f.open('r'); var c = f.read(); f.close();
+        var p = c.split(':');
+        if (p.length !== 3) return null;
+        var ts = parseInt(p[0], 10), dl = parseInt(p[1], 10);
+        if (_navSign(ts, dl) !== p[2]) return null; // falsifié
+        return { timestamp: ts, daysLeft: dl };
+    } catch(e) { return null; }
+}
+
+// ── Vérification serveur via curl ─────────────────────────────────────────────
+function _navServerCheck(mid) {
+    try {
+        var isWin = ($.os.indexOf('Win') !== -1);
+        var url   = PDFNAV_SERVER + '/trial/check?mid=' + mid;
+        var tmp   = isWin
+            ? ($.getenv('TEMP') + '\\pdfnav_tc.json')
+            : '/tmp/.pdfnav_tc';
+        var cmd   = isWin
+            ? 'powershell -WindowStyle Hidden -Command "try{Invoke-WebRequest -Uri \'' + url + '\' -OutFile \'' + tmp + '\' -TimeoutSec 4}catch{}"'
+            : '/usr/bin/curl -s -o "' + tmp + '" --max-time 4 --connect-timeout 3 "' + url + '"';
+        system.callSystem(cmd);
+        var f = new File(tmp);
+        if (!f.exists) return null;
+        f.open('r'); var raw = f.read(); f.close();
+        try { f.remove(); } catch(e) {}
+        if (!raw) return null;
+        var dl = raw.match(/"daysLeft"\s*:\s*(\d+)/);
+        var ex = raw.match(/"expired"\s*:\s*(true|false)/);
+        if (!dl) return null;
+        return { daysLeft: parseInt(dl[1], 10), expired: ex ? ex[1] === 'true' : false };
+    } catch(e) { return null; }
+}
+
+// ── Statut principal ──────────────────────────────────────────────────────────
+function _navStatus() {
+    var mid = _navMachineId();
+    var d1  = _navReadLicFile(PDFNAV_LIC_PATH);
+    var d2  = _navReadLicFile(PDFNAV_LIC_PATH2);
+
+    // Licence pro valide ?
+    var lics = [d1, d2];
+    for (var i = 0; i < lics.length; i++) {
+        var l = lics[i];
+        if (l && l.email && l.key && l.key === _navExpectedKey(l.email))
+            return { mode: 'pro', daysLeft: 9999, email: l.email };
+    }
+
+    // Date d'install la plus ancienne et valide (la plus restrictive)
+    var earliest = 0;
+    for (var j = 0; j < lics.length; j++) {
+        var ll = lics[j];
+        if (ll && _navVerifyLic(ll, mid) && ll.install > 0)
+            if (earliest === 0 || ll.install < earliest) earliest = ll.install;
+    }
+
+    // Premier lancement ou fichier falsifié/manquant → enregistrer
+    var lic = d1 || d2 || { install: 0, email: '', key: '', mid: '', sig: '' };
+    if (!earliest) {
+        earliest    = _navNow();
+        lic.install = earliest; lic.mid = mid; lic.sig = _navSign(earliest, mid);
+        _navWriteLic(lic);
+    } else if (!d1 || !_navVerifyLic(d1, mid) || !d2 || !_navVerifyLic(d2, mid)) {
+        // Un emplacement manquant ou corrompu → restaurer avec la date la plus ancienne
+        lic.install = earliest; lic.mid = mid; lic.sig = _navSign(earliest, mid);
+        _navWriteLic(lic);
+    }
+
+    // ① Serveur (source de vérité absolue)
+    var srv = _navServerCheck(mid);
+    if (srv) {
+        _navWriteCache(srv.daysLeft);
+        return { mode: srv.daysLeft > 0 ? 'trial' : 'expired', daysLeft: srv.daysLeft, email: '' };
+    }
+
+    // ② Cache serveur + grâce hors-ligne
+    var cache = _navReadCache();
+    if (cache) {
+        var sinceCacheD = Math.floor((_navNow() - cache.timestamp) / 86400);
+        if (sinceCacheD <= PDFNAV_OFFLINE_GRACE) {
+            var leftC = Math.max(0, cache.daysLeft - sinceCacheD);
+            return { mode: leftC > 0 ? 'trial' : 'expired', daysLeft: leftC, email: '' };
+        }
+    }
+
+    // ③ Fallback local (hors-ligne prolongé)
+    var elapsed = Math.floor((_navNow() - earliest) / 86400);
+    var leftL   = Math.max(0, PDFNAV_TRIAL_DAYS - elapsed);
+    return { mode: leftL > 0 ? 'trial' : 'expired', daysLeft: leftL, email: '' };
+}
+
 function _navActivate(email, key) {
     var e = (email || '').toLowerCase().replace(/\s/g, '');
     if (!e || key !== _navExpectedKey(e)) return false;
     var lic = _navReadLic(); lic.email = e; lic.key = key;
-    return _navWriteLic(lic);
+    _navWriteLic(lic); return true;
 }
 var pdfNavLicStatus = _navStatus();
 
